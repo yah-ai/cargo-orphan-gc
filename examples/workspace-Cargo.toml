@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.metadata.orphan-gc]
+enabled = true
+# Print each successful GC action.
+verbose = false
+# Retry a small number of previously-blocked orphan families after every compile.
+pending-sweeps-per-compile = 4
+# Optional warning watermark. In orphan-only mode this does NOT authorize
+# eviction of a current generation, so it cannot be a hard disk cap.
+# max-bytes = 214748364800
+# A compiler cache to invoke around rustc. `cargo orphan-gc bootstrap` fills
+# this in automatically when it finds one in build.rustc-wrapper.
+# inner-wrapper = "sccache"

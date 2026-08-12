@@ -1,0 +1,29 @@
+[package]
+name = "cargo-orphan-gc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Conservative GC for the target-dir artifacts compiler caches can't touch: watches build generations supersede each other and deletes only what it saw replaced"
+license = "MIT"
+repository = "https://github.com/yah-ai/cargo-orphan-gc"
+readme = "README.md"
+keywords = ["cargo", "gc", "target", "disk", "incremental"]
+categories = ["development-tools::cargo-plugins", "caching"]
+# Publish checklist (R748-T5): gates F1 (sccache chain) and T3 (invariant
+# tests) are met and reclamation is demonstrated; flipping this to `true`,
+# creating the yah-ai/cargo-orphan-gc mirror, and `cargo publish` are operator
+# actions taken together at release time.
+publish = false
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+dirs = "5"
+fs2 = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+toml_edit = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

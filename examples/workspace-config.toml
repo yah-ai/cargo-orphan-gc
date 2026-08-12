@@ -1,0 +1,13 @@
+[build]
+# The OUTER wrapper slot, deliberately. Nesting under another wrapper (e.g.
+# sccache in rustc-wrapper + this tool in rustc-workspace-wrapper) hands the
+# cache this binary instead of rustc and silently disables caching for every
+# workspace crate. Chain the cache via `inner-wrapper` in Cargo.toml instead.
+rustc-wrapper = "cargo-orphan-gc"
+
+# The inner wrapper's transport to registry/git dependency units, whose cwd
+# and CARGO_MANIFEST_DIR sit inside the registry checkout where workspace
+# discovery cannot reach the metadata. Written by bootstrap alongside
+# inner-wrapper.
+# [env]
+# CARGO_ORPHAN_GC_INNER_WRAPPER = "sccache"
