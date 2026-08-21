@@ -1,19 +1,35 @@
 [package]
 name = "cargo-orphan-gc"
-version = "0.1.0"
+version = "0.8.28"
 edition = "2021"
-rust-version = "1.75"
+# Verified, not guessed: `cargo +1.85.0 test` is green and 1.84 cannot resolve
+# the tree at all (blake3 -> constant_time_eq 0.4 is edition 2024, stabilized
+# in 1.85). The previous claim of 1.75 was false for exactly that reason.
+rust-version = "1.85"
 description = "Conservative GC for the target-dir artifacts compiler caches can't touch: watches build generations supersede each other and deletes only what it saw replaced"
 license = "MIT"
 repository = "https://github.com/yah-ai/cargo-orphan-gc"
 readme = "README.md"
 keywords = ["cargo", "gc", "target", "disk", "incremental"]
 categories = ["development-tools::cargo-plugins", "caching"]
-# Publish checklist (R748-T5): gates F1 (sccache chain) and T3 (invariant
-# tests) are met and reclamation is demonstrated; flipping this to `true`,
-# creating the yah-ai/cargo-orphan-gc mirror, and `cargo publish` are operator
-# actions taken together at release time.
-publish = false
+# Cleared to publish (R748-T5, 2026-08-11): the yah-ai/cargo-orphan-gc mirror
+# exists and the first export has run. Release with
+# `scripts/oss-publish.sh oss/orphan-gc` (DRY_RUN=1 first) — it is idempotent,
+# so a partial-failure retry is safe. Remember a crates.io version can be
+# yanked but never replaced.
+#
+# ALWAYS run `cargo package` with its own target dir:
+#   cargo package --allow-dirty --target-dir target/package-verify
+# The verification build unpacks to `target/package/cargo-orphan-gc-<version>/`,
+# which has no target dir of its own, so by default it writes the *bin* unit's
+# fingerprint into `target/debug/.fingerprint` with a dep-info naming the
+# unpacked copy's sources. Those never change again, so from then on
+# `cargo build` reports "Fresh" forever and `target/debug/cargo-orphan-gc`
+# silently stays frozen at the packaged revision — while `cargo test` keeps
+# rebuilding (different unit hash) and looks like proof the binary is current.
+# Found 2026-08-12 with the binary a day stale. Recovery is
+# `rm -rf target/debug/.fingerprint/cargo-orphan-gc-<hash>` for the bin unit.
+publish = true
 
 [dependencies]
 anyhow = "1"

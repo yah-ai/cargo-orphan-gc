@@ -54,7 +54,10 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        // Fully-qualified on purpose: Rust 1.89 added an inherent
+        // `File::unlock`, which would shadow the `fs2` trait method and make
+        // the impl this crate actually uses depend on the compiler version.
+        let _ = FileExt::unlock(&self.file);
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -86,7 +89,7 @@ pub fn active_inputs(store: &Store) -> Result<ActiveInputs> {
             Ok(()) => {
                 // Nobody owns the lease anymore. It is stale (usually a process
                 // that crashed or exited without cleanup).
-                let _ = file.unlock();
+                let _ = FileExt::unlock(&file);
                 drop(file);
                 let _ = fs::remove_file(&path);
             }

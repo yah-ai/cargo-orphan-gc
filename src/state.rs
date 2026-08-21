@@ -26,6 +26,13 @@ pub struct Generation {
     pub id: String,
     pub created_unix_ms: u128,
     pub artifacts: Vec<OwnedArtifact>,
+    /// When this generation was superseded and pushed into `orphans`. `None`
+    /// for a *current* generation (never orphaned) and for state files
+    /// written before this field existed — those get zero grace, which only
+    /// widens what one sweep might reclaim, never what it deletes unsafely
+    /// (R770: the grace period this stamps is itself the safety margin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphaned_unix_ms: Option<u128>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +43,12 @@ pub struct FamilyState {
     pub last_used_unix_ms: u128,
     pub current: Option<Generation>,
     pub orphans: Vec<Generation>,
+    /// Compiles served from the previous generation's artifact list without
+    /// walking the out-dir. Bounds how long a newly-emitted artifact can stay
+    /// unrecorded; see `artifacts::collect`. Serde-defaulted so state files
+    /// written before this field load unchanged.
+    #[serde(default)]
+    pub compiles_since_scan: u32,
 }
 
 impl FamilyState {
@@ -47,6 +60,7 @@ impl FamilyState {
             last_used_unix_ms: now_ms(),
             current: None,
             orphans: Vec::new(),
+            compiles_since_scan: 0,
         }
     }
 }
@@ -86,7 +100,15 @@ impl Store {
 
     pub fn lock_family(&self, key: &str) -> Result<File> {
         let path = self.root.join("locks").join(format!("{key}.lock"));
-        let file = OpenOptions::new().create(true).read(true).write(true).open(&path)?;
+        // truncate(false) is explicit, not incidental: this file carries no
+        // contents, only the advisory lock, and truncating it out from under a
+        // concurrent holder would be a write to a file another process owns.
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
         file.lock_exclusive()
             .with_context(|| format!("lock family {key}"))?;
         Ok(file)
@@ -132,6 +154,42 @@ impl Store {
 
     pub fn clear_pending(&self, key: &str) {
         let _ = fs::remove_file(self.root.join("pending").join(key));
+    }
+
+    fn pending_sweep_marker(&self) -> PathBuf {
+        self.root.join("pending-sweep-marker")
+    }
+
+    /// Whether at least `min_interval_ms` has elapsed since `sweep_pending`
+    /// last actually ran (or it has never run). The hot path uses this to
+    /// throttle background reclamation instead of paying for it on every
+    /// single compile — measured live on a busy camp (yah chat, 2026-08-20):
+    /// an unthrottled `sweep_pending` cost 35-90ms regardless of the unit
+    /// being compiled, a 20-77% latency tax on fast/incremental compiles
+    /// specifically because the cost is fixed while `rustc`'s own time is
+    /// not. `sweep_pending` exists to close a 6-9 minute vanish window
+    /// (R770); a few seconds of throttling spends none of that margin.
+    ///
+    /// Fails open toward "due": a missing or unreadable marker counts as due
+    /// rather than as "just ran", so a corrupt/absent marker can only make
+    /// reclamation happen more often, never stop it.
+    pub fn due_for_pending_sweep(&self, min_interval_ms: u128) -> bool {
+        let Ok(meta) = fs::metadata(self.pending_sweep_marker()) else {
+            return true;
+        };
+        let Ok(modified) = meta.modified() else {
+            return true;
+        };
+        let elapsed = SystemTime::now().duration_since(modified).unwrap_or_default().as_millis();
+        elapsed >= min_interval_ms
+    }
+
+    /// Reset the throttle window. Best-effort by construction, same as
+    /// [`Log::write`](crate::log::Log::write): this runs inside a rustc
+    /// invocation, and failing a compile because a marker file could not be
+    /// touched would be a far worse bug than skipping one throttle reset.
+    pub fn mark_pending_sweep_done(&self) {
+        let _ = File::create(self.pending_sweep_marker());
     }
 
     pub fn pending_keys(&self, limit: usize) -> Result<Vec<String>> {
@@ -189,4 +247,33 @@ pub fn generation_id(artifacts: &[OwnedArtifact]) -> String {
         hasher.update(&[0]);
     }
     hasher.finalize().to_hex().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_in(dir: &Path) -> Store {
+        let store = Store { root: dir.join("state") };
+        store.ensure_layout().unwrap();
+        store
+    }
+
+    #[test]
+    fn a_missing_marker_is_due_and_running_resets_the_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_in(tmp.path());
+
+        assert!(store.due_for_pending_sweep(5_000), "never run before, so due immediately");
+
+        store.mark_pending_sweep_done();
+        assert!(
+            !store.due_for_pending_sweep(5_000),
+            "just ran, must not be due again inside the window"
+        );
+        assert!(
+            store.due_for_pending_sweep(0),
+            "a zero interval disables throttling regardless of the marker"
+        );
+    }
 }

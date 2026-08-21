@@ -8,6 +8,13 @@
 //! @yah:gotcha("The adoption blocker was NOT per-invocation overhead — that measured 2-5 ms (W307) and was the wrong thing to worry about. It is that nesting under sccache silently collapses the cache: 'multiple input files', 0 hits, 0 misses. Root cause is now diagnosed (see -F1) and reproduces with a pure passthrough script, so it is cargo's wrapper NESTING, not anything this tool does. Any future wrapper-chain work must re-run that A/B — the failure is invisible without reading sccache stats.")
 //! @yah:assumes("That orphan-only deletion plus the LRU budget mode is enough policy. Measured today: orphan-only reclaimed ZERO bytes across four scenarios (source edit, feature change, rustflags change, rebuild) because a stable path set REFRESHES a generation rather than orphaning it, and feature/rustflags changes fork a NEW family that leaks by Invariant C. Budget mode covers the fork case. -F2 covers the stable-path-set case. If neither fires on real workloads, the lifetime policy itself is wrong and that is the thing to learn before publishing.")
 //! @arch:see(oss/orphan-gc/ARCHITECTURE.md)
+//! @yah:notify_on(R742-F1, "Durable copy of a party.chat sent to @Ashguard:eclipse on 2026-08-11 (R742-F1 / @Ashguard:libra). cargo-orphan-gc deletes rmeta/rlib for a crate DURING the same cargo invocation about to link against it, so `cargo check --workspace --all-targets` in oss/yubaba fails camp-wide. Isolated, not inferred: WITH `rustc-wrapper = \\\"cargo-orphan-gc\\\"` (.cargo/config.toml:18) it exits 101 twice in a row on a DIFFERENT crate each time — run 1 `can't find crate for yah_scryer` (oss/qed/crates/velveteen-exec/src/integration.rs:38) plus `extern location for task_runs does not exist`, run 2 `can't find crate for velveteen_exec` (crates/cloud/src/reconciler/mesofact_static.rs:238) — each immediately after that crate's own `deleted 2 artifacts` log line. WITHOUT it (CARGO_BUILD_RUSTC_WRAPPER=/Users/leif/ss/yah/.cargo/rustc-wrapper.sh, the sccache shim alone) the same tree exits 0 with 0 errors. Every reaped crate lives in a SIBLING workspace (oss/qed, oss/yah-base, oss/kamaji) reached through [patch.crates-io] into oss/yubaba/target — my inference from log ordering, having not read gc.rs, is that a path-dep outside the current workspace reads as orphaned to the reachability walk while a live build still needs it. I touched nothing in oss/orphan-gc or .cargo/config.toml. Also an argument for R748-F6: shadow mode would have caught this for free, which is a case for it being the default on a shared tree rather than opt-in.")
+//! @yah:handoff("R748-B10 and R748-F6 landed together and are in review (B10 first, because shadow mode's whole value is its report and the old report channel was cargo's replayed stderr). Shadow is now the DEFAULT: enabled = true alone learns and reports and deletes nothing; deletion needs an explicit dry-run = false. The camp's root Cargo.toml gained an explicit dry-run = true line next to enabled = false, so whoever re-enables gets the safe rung by default - that is the only file outside oss/orphan-gc this touched.")
+//! @yah:handoff("DOGFOODING, operator-authorized 2026-08-12: the camp root Cargo.toml is now enabled = true + dry-run = true (shadow). State was purged first per R748-B9's gotcha, and the new binary was installed BEFORE enabling - the old one predates dry-run and would have deleted. Verified beforehand that replacing the wrapper binary at the same path does NOT invalidate cargo fingerprints, so no rebuild storm for peers. @Ashguard:eclipse, @Ashguard:libra and @Ashguard:spade were notified. Back out with enabled = false; nothing else needs touching.")
+//! @yah:handoff("First camp-scale evidence, ~25 minutes of peers' real builds: 23 families learned, 30250 current artifacts (37 GB), and would-reclaim = 0 orphan artifacts + 58 surplus incremental sessions (7.19 GB). That CONFIRMS this relay's standing assumption at scale rather than refuting it: orphan-only supersession reclaims nothing here (every queued record is a path the current generation reuses, Invariant D), and 100% of the reclaimable value is R748-F2's surplus-session collector. Also fixed a label that was lying about exactly this - status said 'orphan artifacts pending deletion: 1.17 GB' for records whose real reclaimable value is zero; it now reads 'orphan records queued (not all reclaimable)'.")
+//! @yah:gotcha("DO NOT ARCHIVE - operator decision 2026-08-12. R748 is the only relay holding cargo-orphan-gc, and the camp is now dogfooding it in deleting mode, so bugs and mistakes from real use land as children here. R748-T11 is the open child that keeps this relay alive; it closes when 0.8 ships. Ten children sitting in review is expected state, not a finished relay.")
+//! @yah:gotcha("BYTE ACCOUNTING OVER-COUNTED 24x AND IT REACHED THE BUDGET CEILING (fixed 2026-08-14). status reported current artifacts of 1,800,626,861,376 bytes (1.8 TB) against a real 365 GB tree. Cause: owned_size for an IncrementalDir measures the key dirs under the profile-wide incremental ROOT matching session_prefix, and BOTH gc::budget_sweep and cli::status_cmd summed it once per family. Family identity is hash-sensitive (B9), so a crate forks a new family per unit-hash while session_prefix stays the crate name: 66 families all measuring the same yah key dirs, 3356 incremental-dir records collapsing to 380 distinct (path, prefix) pairs, 1978 GB counted for a real 81 GB. This was NOT cosmetic: max-bytes under budget-mode = lru-current-families is compared against exactly this total, so enabling budget mode would have read the ceiling as breached on a tree nowhere near it and retired cold families camp-wide for nothing. Fix is artifacts::size_identity + artifacts::SizeTotal (dedup by the identity owned_size actually measures), used at both totalling sites; budget_sweep charges each identity to the first family claiming it so per-family figures sum to bytes_before. Status now reads 180 GB, matching an independent census (95.4 GB out-dir + 81.2 GB incremental). Test: gc::tests::budget_total_charges_a_shared_incremental_root_once.")
+//! @yah:handoff("DISK CRISIS WORK, 2026-08-14 (operator-directed, @Glimmerstone:spade). Rig was at 52 GiB free and falling ~30 GiB/day. Three independent silent failures found, all fixed; 186 GiB reclaimed in one pass (52 to 238 GiB free, 935,881 paths). (1) The launchd janitor dev.yah.cargo-sweep had NEVER reclaimed a byte since install: cargo is not on launchds PATH, so cargo-sweeps internal cargo metadata died with ENOENT and every project was skipped, logging swept 0/24 unreachable=24 on every 6h firing. Reproduced deterministically. Retired per operator direction (one janitor, camp-driven, no bespoke launchd) and both files removed. (2) camp_service::sweep gained the policy it was missing: file-granularity reclaim over deps/ at a 16h cutoff, which is where 190 of the 365 GB sat. Its two existing policies structurally never fire on a worked camp (21-day retention for an active camp; a census found NOTHING older than 7 days anywhere, so this is churn not stale accumulation). Excludes incremental/ deliberately, since deleting a subset of a sessions files yields a corrupt cache and plan_incremental already owns that subtree safely. Also added plan_camps to stop nested camps (oss/mesofact is a camp AND lives under yah) reporting the same target dir twice. (3) sccache was serving a DEAD cache: the one-server-per-user singleton was pinned to a qed worktrees TMPDIR at a 0.18 percent hit rate while the real 43 GB cache sat unused. Restarted pinned to the real dir, verified 74 hits / 104 on a controlled clean-and-rebuild. Structural fix belongs to R744-T2, which now carries the measured evidence. 47 sweep tests pass (7 new), 44 orphan-gc tests pass (1 new).")
 //!
 //! @yah:ticket(R748-T3, "Cover invariants A-G with tests before this deletes files on anyone else's machine")
 //! @yah:at(2026-08-11T07:49:10Z)
@@ -19,22 +26,38 @@
 //! @yah:next("8 tests for ~1400 lines, in a tool whose entire job is deleting build artifacts. The invariants are crisply stated in ARCHITECTURE.md §4 and individually testable; most are asserted only by prose. Missing coverage, by invariant: A (a FAILED rustc must not retire the previous generation — nothing tests the compile-error path); B (an artifact never recorded in a persisted Generation is never deletable, i.e. a pre-existing file in the out-dir survives); C (a build-grid change forks a family and leaks rather than cross-deleting); D (a path reused by the new generation is dropped from the orphan set WITHOUT deletion); F (each of the three kind-specific path validations fails CLOSED — out-dir entry outside its recorded parent, explicit emit outside the out-dir, incremental path != ownership root). E and G have one test each from the budget-mode work and should be kept.\n\nPublishing to crates.io without these means shipping unproven deletion authority to strangers' machines.")
 //! @yah:verify("cargo test in oss/orphan-gc, with at least one named test per invariant A-G and the invariant letter in the test name so the mapping is greppable.")
 //! @yah:gotcha("Invariant A's test needs a rustc that exits non-zero AFTER a successful prior generation exists, which the current fixtures never construct — they all drive gc:: directly rather than through wrapper::run. Testing the wrapper path may need the real-rustc invocation behind a seam.")
+//!
+//! @yah:ticket(R748-B13, "orphan-gc tracked bytes run 1.7-1.8 TB against 150 GiB max-bytes with budget-mode still orphan-only, so nothing enforces the ceiling")
+//! @yah:at(2026-08-16T01:25:26Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R748)
+//! @yah:next("Check whether the 1.7-1.8 TB tracked-bytes figure is real (independent census, e.g. du -sh target/) or another size_identity double-count -- the dedup fix already landed for the budget_sweep/status totalling sites (R748-B7/B9 handoffs in gc.rs), so if this total comes from a THIRD site that sums owned_size without SizeTotal's dedup, that is the likely bug, not an actual 11x-over tree.")
+//! @yah:next("If the figure is real: decide whether to flip budget-mode to lru-current-families (starts retiring cold families under the ceiling) or raise max-bytes -- an operator call, not a code fix.")
+//! @yah:gotcha("Noticed in passing during R770 (2026-08-15): every compile's tracked-bytes check (wrapper.rs run_in, budget_ceiling watermark warning) is reading 1.7-1.8 TB against the camp's 150 GiB max-bytes -- an 11x overage -- on every single compile, and nothing acts on it because [workspace.metadata.orphan-gc] budget-mode is still the default orphan-only, under which max-bytes is a watermark, not a ceiling (config.rs Policy::budget_ceiling returns None unless budget-mode = \"lru-current-families\"). Not chased further; not yet confirmed whether the 1.7-1.8 TB figure itself is real or another instance of the size_identity double-count class (R748-B9's gotcha: hash-sensitive family identity forks a new family per unit-hash while session_prefix stays the crate name, and an earlier occurrence of exactly this dedup bug read 1978 GB for a real 81 GB before the fix in artifacts::size_identity / SizeTotal).")
 
 use std::collections::HashSet;
 
 use anyhow::Result;
 
 use crate::artifacts;
-use crate::config::Policy;
+use crate::config::{Mode, Policy};
 #[cfg(test)]
 use crate::config::BudgetMode;
 use crate::lease;
-use crate::state::Store;
+use crate::log::Log;
+use crate::state::{now_ms, Store};
 
 #[derive(Default, Debug)]
 pub struct SweepReport {
     pub deleted_artifacts: usize,
     pub deleted_bytes: u64,
+    /// Records dropped because the path was already gone by the time the
+    /// sweep reached it — a race with something else on the same tree, not a
+    /// reclaim this sweep can take credit for. Counted separately so
+    /// `deleted_bytes` stays a real bytes-freed figure instead of being
+    /// diluted toward zero by these no-op hits.
+    pub already_gone_artifacts: usize,
     pub deferred_artifacts: usize,
     /// Surplus finalized rustc sessions collected inside tracked incremental
     /// dirs — reclamation that generation supersession cannot see, because a
@@ -48,6 +71,7 @@ impl SweepReport {
     fn absorb(&mut self, other: SweepReport) {
         self.deleted_artifacts += other.deleted_artifacts;
         self.deleted_bytes = self.deleted_bytes.saturating_add(other.deleted_bytes);
+        self.already_gone_artifacts += other.already_gone_artifacts;
         self.deferred_artifacts += other.deferred_artifacts;
         self.collected_sessions += other.collected_sessions;
         self.collected_session_bytes = self
@@ -75,8 +99,11 @@ pub fn sweep_locked_protecting(
     policy: &Policy,
     protected: &HashSet<std::path::PathBuf>,
 ) -> Result<SweepReport> {
+    let mode = policy.mode();
     let Some(mut state) = store.load_family(key)? else {
-        store.clear_pending(key);
+        if mode == Mode::Delete {
+            store.clear_pending(key);
+        }
         return Ok(SweepReport::default());
     };
 
@@ -91,12 +118,39 @@ pub fn sweep_locked_protecting(
     let mut report = SweepReport::default();
     let mut retained_generations = Vec::new();
 
+    let now = now_ms();
     for mut generation in state.orphans.drain(..) {
+        // R770: a Lease only protects the extern inputs of a rustc invocation
+        // currently running — it has no view of cargo's build plan, so a unit
+        // that will need this generation's artifact but hasn't started yet is
+        // invisible to `lease::active_inputs`. Give the generation a grace
+        // window before any sweep (this family's own, or an unrelated
+        // family's `sweep_pending` retry) may delete out of it, so cargo has
+        // time to either start that downstream unit — which then leases the
+        // path itself — or the window closes without incident. Every artifact
+        // defers together, same bucket as an active-lease hit, so a young
+        // generation is retried rather than dropped.
+        let age = now.saturating_sub(generation.orphaned_unix_ms.unwrap_or(0));
+        if age < policy.orphan_grace_ms {
+            report.deferred_artifacts += generation.artifacts.len();
+            retained_generations.push(generation);
+            continue;
+        }
+
         let mut retained_artifacts = Vec::new();
         for artifact in generation.artifacts.drain(..) {
             if current_paths.contains(&artifact.path) {
                 // Same path was overwritten/reused by the current generation.
                 // It is not an orphan anymore and must never be deleted.
+                continue;
+            }
+
+            if artifact.kind == artifacts::ArtifactKind::IncrementalDir {
+                // An incremental record anchors prefix-scoped session
+                // collection on a root shared by the whole workspace; the
+                // family never owned that root, so orphaning one must not
+                // delete anything. Dropping it (rather than retaining it)
+                // keeps the generation able to empty out and retire.
                 continue;
             }
 
@@ -106,17 +160,39 @@ pub fn sweep_locked_protecting(
                 continue;
             }
 
-            match artifacts::remove(&artifact) {
-                Ok(bytes) => {
+            // Shadow asks the deletion gate the same question and stops short
+            // of the answer, so a would-delete figure can never promise
+            // reclamation the real sweep would refuse.
+            let outcome = match mode {
+                Mode::Shadow => artifacts::check_deletable(&artifact).map(|()| {
+                    if artifact.path.exists() {
+                        artifacts::Reclaim::Freed(artifacts::path_size(&artifact.path).unwrap_or(0))
+                    } else {
+                        artifacts::Reclaim::AlreadyGone
+                    }
+                }),
+                Mode::Delete => artifacts::remove(&artifact),
+            };
+            match outcome {
+                Ok(artifacts::Reclaim::Freed(bytes)) => {
                     report.deleted_artifacts += 1;
                     report.deleted_bytes = report.deleted_bytes.saturating_add(bytes);
+                    if mode.is_shadow() {
+                        retained_artifacts.push(artifact);
+                    }
+                }
+                Ok(artifacts::Reclaim::AlreadyGone) => {
+                    report.already_gone_artifacts += 1;
+                    if mode.is_shadow() {
+                        retained_artifacts.push(artifact);
+                    }
                 }
                 Err(err) => {
                     if policy.verbose {
-                        eprintln!(
-                            "cargo-orphan-gc: defer deletion of {}: {err:#}",
+                        Log::for_store(store).write(&format!(
+                            "defer deletion of {}: {err:#}",
                             artifact.path.display()
-                        );
+                        ));
                     }
                     report.deferred_artifacts += 1;
                     retained_artifacts.push(artifact);
@@ -134,14 +210,17 @@ pub fn sweep_locked_protecting(
 
     // The free tier: surplus finalized sessions inside the *current*
     // generation's incremental dirs. Runs under the same family lock as
-    // everything else here. Orphaned incremental dirs need no per-session
-    // treatment — they are deleted whole by the orphan pass above.
+    // everything else here. This is the ONLY path that reclaims incremental
+    // space — the orphan pass above deliberately skips incremental anchors,
+    // because the path they record is the profile-wide root shared by every
+    // crate rather than anything this family owns.
     if let Some(current) = state.current.as_ref() {
         for artifact in &current.artifacts {
             if artifact.kind == artifacts::ArtifactKind::IncrementalDir {
                 let collected = artifacts::collect_surplus_sessions(
                     &artifact.path,
                     artifact.session_prefix.as_deref(),
+                    mode,
                 );
                 report.collected_sessions += collected.deleted_sessions;
                 report.collected_session_bytes = report
@@ -149,6 +228,14 @@ pub fn sweep_locked_protecting(
                     .saturating_add(collected.deleted_bytes);
             }
         }
+    }
+
+    // A shadow sweep is a pure read, and deliberately so: it must not advance
+    // the bookkeeping either. Dropping an anchor or clearing `pending` here
+    // would mean the first real sweep after `dry-run = false` acted on a
+    // different queue than the one the operator read the report for.
+    if mode.is_shadow() {
+        return Ok(report);
     }
 
     store.save_family(&state)?;
@@ -167,7 +254,34 @@ pub fn sweep_pending(store: &Store, policy: &Policy, limit: usize, skip: Option<
             continue;
         }
         let _lock = store.lock_family(&key)?;
-        total.absorb(sweep_locked(store, &key, policy)?);
+        let report = sweep_locked(store, &key, policy)?;
+        // This is the ONLY deletion path the wrapper's own per-compile log
+        // line never covers (wrapper::run_in discards this function's return
+        // value with `let _ =`), so without per-family logging here a
+        // background sweep triggered by an unrelated crate's compile deletes
+        // silently — no line in `cargo orphan-gc log` ever names the family
+        // it touched. Found the hard way (R770): an rmeta went missing for a
+        // crate whose own compiles never logged a nonzero deletion all day.
+        if policy.verbose
+            && (report.deleted_artifacts > 0
+                || report.already_gone_artifacts > 0
+                || report.deferred_artifacts > 0)
+        {
+            let label = store
+                .load_family(&key)?
+                .map(|s| s.label)
+                .unwrap_or_else(|| key.clone());
+            Log::for_store(store).write(&format!(
+                "background sweep of pending family {label}: {} {} artifacts ({} bytes; {} \
+                 already gone), deferred {}",
+                policy.mode().verb(),
+                report.deleted_artifacts,
+                report.deleted_bytes,
+                report.already_gone_artifacts,
+                report.deferred_artifacts,
+            ));
+        }
+        total.absorb(report);
     }
     Ok(total)
 }
@@ -175,7 +289,13 @@ pub fn sweep_pending(store: &Store, policy: &Policy, limit: usize, skip: Option<
 pub fn sweep_all(store: &Store, policy: &Policy) -> Result<SweepReport> {
     let mut total = SweepReport::default();
     for key in store.family_keys()? {
-        let _lock = store.lock_family(&key)?;
+        // A shadow sweep writes nothing, so it does not take the family lock:
+        // `status` reports through this path and must never block behind a
+        // live compile holding the lock for a whole rustc invocation.
+        let _lock = match policy.mode() {
+            Mode::Shadow => None,
+            Mode::Delete => Some(store.lock_family(&key)?),
+        };
         total.absorb(sweep_locked(store, &key, policy)?);
     }
     Ok(total)
@@ -221,6 +341,9 @@ pub fn budget_sweep(store: &Store, policy: &Policy) -> Result<BudgetReport> {
 
     // (key, last_used_at_measure_time, current bytes)
     let mut families: Vec<(String, u128, u64)> = Vec::new();
+    // Size identities already charged to some family, so no byte is counted
+    // twice across the whole tree. See the dedup note in the loop below.
+    let mut charged: HashSet<(std::path::PathBuf, Option<String>)> = HashSet::new();
     // Every path any family currently owns, keyed by owner. Retiring one
     // family must not delete a path another family still holds current.
     let mut owned: Vec<(String, HashSet<std::path::PathBuf>)> = Vec::new();
@@ -231,11 +354,34 @@ pub fn budget_sweep(store: &Store, policy: &Policy) -> Result<BudgetReport> {
         let Some(current) = state.current.as_ref() else {
             continue;
         };
-        let bytes = current
-            .artifacts
-            .iter()
-            .map(|a| artifacts::path_size(&a.path).unwrap_or(0))
-            .fold(0u64, |acc, b| acc.saturating_add(b));
+        // Charge each distinct `size_identity` to the FIRST family that claims
+        // it, so the per-family figures sum to exactly `bytes_before` and the
+        // `running` arithmetic below stays consistent with the ceiling it is
+        // compared against.
+        //
+        // This dedup is load-bearing, not tidiness. Family identity is
+        // hash-sensitive, so a crate forks a new family on every unit-hash
+        // change while its `session_prefix` stays the crate name — this camp
+        // reached 66 families all measuring the same incremental key dirs, and
+        // an undeduped total read 1978 GB for a real 81 GB. Comparing a 24x
+        // over-count against `max-bytes` would report the ceiling breached on
+        // a tree nowhere near it and retire cold families for nothing.
+        //
+        // The attribution is first-claim and therefore arbitrary between two
+        // families sharing an incremental root: a family charged 0 bytes for a
+        // shared dir sorts as cheap to retire, and retiring it frees nothing
+        // because the other owner still holds it. That is the safe direction
+        // (under-reclaim, never over-delete) and it is bounded by the
+        // `leftover` recount after each sweep below.
+        let bytes = {
+            let mut t = artifacts::SizeTotal::new();
+            for a in &current.artifacts {
+                if charged.insert(artifacts::size_identity(a)) {
+                    t.add(a);
+                }
+            }
+            t.bytes()
+        };
         report.bytes_before = report.bytes_before.saturating_add(bytes);
         owned.push((
             key.clone(),
@@ -263,6 +409,27 @@ pub fn budget_sweep(store: &Store, policy: &Policy) -> Result<BudgetReport> {
     // budget is reported (`bytes_after > ceiling`) rather than obeyed.
     families.pop();
 
+    // Retirement is the third deletion path, and the only one that can take a
+    // generation nothing superseded. In shadow it stops at the plan: which
+    // families the LRU order would reach, and how far under the ceiling that
+    // would get. Deliberately not simulated further than that — the byte figure
+    // assumes each retired family's current artifacts are then fully
+    // reclaimable, where a real run may defer some behind an active lease or a
+    // path another family still holds, so treat it as the optimistic bound it
+    // is. What matters before authorizing is *which* families go, and that is
+    // exact.
+    if policy.mode().is_shadow() {
+        for (_, _, bytes) in &families {
+            if running <= ceiling {
+                break;
+            }
+            running = running.saturating_sub(*bytes);
+            report.retired_families += 1;
+        }
+        report.bytes_after = running;
+        return Ok(report);
+    }
+
     for (key, measured_last_used, bytes) in families {
         if running <= ceiling {
             break;
@@ -281,17 +448,25 @@ pub fn budget_sweep(store: &Store, policy: &Policy) -> Result<BudgetReport> {
             report.raced_families += 1;
             continue;
         }
-        let Some(current) = state.current.take() else {
+        let Some(mut current) = state.current.take() else {
             continue;
         };
 
         if policy.verbose {
-            eprintln!(
-                "cargo-orphan-gc: budget retire {} ({bytes} bytes, idle since {}ms)",
+            Log::for_store(store).write(&format!(
+                "budget retire {} ({bytes} bytes, idle since {}ms)",
                 state.label, state.last_used_unix_ms
-            );
+            ));
         }
 
+        // Not `now_ms()`: the grace period below exists for the cross-family
+        // `sweep_pending` race (an unrelated compile's background retry
+        // outrunning cargo's build plan by minutes). Budget retirement has no
+        // such gap — it sweeps the SAME generation it just orphaned, under
+        // the SAME lock, in the SAME call, re-checking active leases fresh —
+        // so stamp it pre-aged and let it reclaim on the ceiling's schedule
+        // rather than the race mitigation's.
+        current.orphaned_unix_ms = Some(0);
         state.orphans.push(current);
         store.save_family(&state)?;
         store.mark_pending(&key)?;
@@ -316,7 +491,7 @@ pub fn budget_sweep(store: &Store, policy: &Policy) -> Result<BudgetReport> {
                 s.orphans
                     .iter()
                     .flat_map(|g| g.artifacts.iter())
-                    .map(|a| artifacts::path_size(&a.path).unwrap_or(0))
+                    .map(|a| artifacts::owned_size(a).unwrap_or(0))
                     .fold(0u64, |acc, b| acc.saturating_add(b))
             })
             .unwrap_or(0);
@@ -356,17 +531,26 @@ mod tests {
             id: crate::state::generation_id(&artifacts),
             created_unix_ms: now_ms(),
             artifacts,
+            orphaned_unix_ms: None,
         });
         store.save_family(&state).unwrap();
     }
 
+    /// A policy that actually deletes. `dry-run` defaults to true (shadow), so
+    /// every test that asserts reclamation has to say so — which is the
+    /// behaviour R748-F6 is buying, spelled out at each fixture.
     fn policy(max_bytes: Option<u64>, mode: BudgetMode) -> Policy {
         Policy {
             enabled: true,
+            dry_run: false,
             max_bytes,
             budget_mode: mode,
             ..Policy::default()
         }
+    }
+
+    fn shadow_of(policy: &Policy) -> Policy {
+        Policy { dry_run: true, ..policy.clone() }
     }
 
     fn store_in(dir: &std::path::Path) -> Store {
@@ -432,6 +616,60 @@ mod tests {
         );
     }
 
+    /// Cargo passes `-C incremental=<profile-wide root>`, not a per-crate
+    /// directory — rustc creates the key dir underneath. So an incremental
+    /// record names a path shared by every crate in the workspace, and
+    /// orphaning one must reclaim nothing.
+    ///
+    /// Found live: installing on a ten-agent camp recorded
+    /// `target/debug/incremental` as an owned artifact of a single crate, and
+    /// the orphan pass would have deleted 17 GB of everyone else's incremental
+    /// state whole. Invariant D did not cover it — D compares against the same
+    /// family's current paths, and a family that stops listing the anchor
+    /// hands it straight to the deletion path.
+    #[test]
+    fn an_orphaned_incremental_anchor_never_deletes_the_shared_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_in(tmp.path());
+        let incr = tmp.path().join("incremental");
+        // Another crate's key dir, of the kind the camp had 611 of.
+        let foreign_key = incr.join("someone-else-abc123");
+        fs::create_dir_all(foreign_key.join("s-100-aaa")).unwrap();
+        fs::write(foreign_key.join("s-100-aaa/dep-graph.bin"), b"not yours").unwrap();
+
+        let key = blake3::hash(b"anchor").to_hex().to_string();
+        let mut state = FamilyState::new(&key, "mycrate");
+        // Orphaned, and the current generation does not list it — exactly the
+        // shape that reaches `artifacts::remove`.
+        state.orphans.push(Generation {
+            id: "old".into(),
+            created_unix_ms: now_ms(),
+            artifacts: vec![OwnedArtifact {
+                path: incr.clone(),
+                root: incr.clone(),
+                kind: ArtifactKind::IncrementalDir,
+                session_prefix: Some("mycrate".into()),
+            }],
+            orphaned_unix_ms: Some(0),
+        });
+        store.save_family(&state).unwrap();
+
+        let report = {
+            let _lock = store.lock_family(&key).unwrap();
+            sweep_locked(&store, &key, &policy(None, BudgetMode::OrphanOnly)).unwrap()
+        };
+
+        assert_eq!(report.deleted_artifacts, 0, "{report:?}");
+        assert!(incr.is_dir(), "the shared incremental root must survive");
+        assert!(
+            foreign_key.join("s-100-aaa/dep-graph.bin").exists(),
+            "another crate's session must survive"
+        );
+        // And the anchor is dropped rather than queued forever.
+        let after = store.load_family(&key).unwrap().unwrap();
+        assert!(after.orphans.iter().all(|g| g.artifacts.is_empty()));
+    }
+
     /// Cargo emits unhashed outputs (the final binary and its `.d`) that
     /// several families legitimately share. Retiring a cold family must not
     /// delete a path a surviving family still holds current — Invariant D is
@@ -472,6 +710,7 @@ mod tests {
                 id: crate::state::generation_id(&artifacts),
                 created_unix_ms: now_ms(),
                 artifacts,
+                orphaned_unix_ms: None,
             });
             store.save_family(&state).unwrap();
         }
@@ -539,11 +778,13 @@ mod tests {
             id: "old".into(),
             created_unix_ms: now_ms(),
             artifacts: vec![artifact(&reused), artifact(&superseded)],
+            orphaned_unix_ms: Some(0),
         });
         state.current = Some(Generation {
             id: "new".into(),
             created_unix_ms: now_ms(),
             artifacts: vec![artifact(&reused)],
+            orphaned_unix_ms: None,
         });
         store.save_family(&state).unwrap();
 
@@ -557,6 +798,236 @@ mod tests {
         assert!(!superseded.exists());
         let after = store.load_family(&key).unwrap().unwrap();
         assert!(after.orphans.is_empty(), "the reused path leaves the orphan set");
+    }
+
+    /// R770 — a Lease only protects the `--extern` inputs of a rustc
+    /// invocation that is *currently running*; it has no view of cargo's
+    /// build plan, so `sweep_pending`'s cross-family background retries can
+    /// reach a generation minutes before the downstream unit that still needs
+    /// it has even started (measured on this camp: a 6-9 minute vanish
+    /// window). A freshly-orphaned generation must defer whole, not just its
+    /// individual artifacts, until `orphan_grace_ms` has elapsed — and an aged
+    /// one must sweep exactly as before.
+    #[test]
+    fn a_generation_orphaned_within_the_grace_period_is_deferred_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_in(tmp.path());
+        let deps = tmp.path().join("deps");
+        fs::create_dir_all(&deps).unwrap();
+        let doomed = deps.join("libfoo-abc.rlib");
+        fs::write(&doomed, vec![0u8; 100]).unwrap();
+
+        let artifact = OwnedArtifact {
+            path: doomed.clone(),
+            root: deps.clone(),
+            kind: ArtifactKind::OutDirEntry,
+            session_prefix: None,
+        };
+        let key = blake3::hash(b"grace").to_hex().to_string();
+        let mut state = FamilyState::new(&key, "foo");
+        state.orphans.push(Generation {
+            id: "old".into(),
+            created_unix_ms: now_ms(),
+            artifacts: vec![artifact],
+            orphaned_unix_ms: Some(now_ms()), // orphaned just now
+        });
+        store.save_family(&state).unwrap();
+
+        let graced_policy = Policy { orphan_grace_ms: 60_000, ..policy(None, BudgetMode::OrphanOnly) };
+        let report = {
+            let _lock = store.lock_family(&key).unwrap();
+            sweep_locked(&store, &key, &graced_policy).unwrap()
+        };
+        assert_eq!(report.deleted_artifacts, 0, "{report:?}");
+        assert_eq!(report.deferred_artifacts, 1, "{report:?}");
+        assert!(doomed.exists(), "a generation inside its grace window must survive");
+        let after = store.load_family(&key).unwrap().unwrap();
+        assert_eq!(
+            after.orphans.iter().flat_map(|g| g.artifacts.iter()).count(),
+            1,
+            "still queued for retry once the grace period elapses"
+        );
+
+        // Same fixture, aged past the grace period: sweeps exactly as an
+        // ungraced orphan would.
+        let mut state = store.load_family(&key).unwrap().unwrap();
+        for generation in &mut state.orphans {
+            generation.orphaned_unix_ms = Some(0);
+        }
+        store.save_family(&state).unwrap();
+        let report = {
+            let _lock = store.lock_family(&key).unwrap();
+            sweep_locked(&store, &key, &graced_policy).unwrap()
+        };
+        assert_eq!(report.deleted_artifacts, 1, "{report:?}");
+        assert!(!doomed.exists(), "an aged-out generation sweeps normally");
+    }
+
+    /// An orphan whose file is already gone by the time the sweep reaches it
+    /// (something else won the race — routine in a concurrent camp) must not
+    /// be counted as a `deleted_bytes`-bearing reclaim: that conflation is
+    /// what made every real deletion line in the operational log read
+    /// `(0 bytes)`, because `AlreadyGone` hits vastly outnumber real `Freed`
+    /// ones and summed together as one figure they round to zero.
+    #[test]
+    fn an_orphan_already_gone_from_disk_is_counted_separately_from_a_real_reclaim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_in(tmp.path());
+        let deps = tmp.path().join("deps");
+        fs::create_dir_all(&deps).unwrap();
+        let real = deps.join("libfoo-real.rlib");
+        let already_gone = deps.join("libfoo-gone.rlib");
+        fs::write(&real, vec![0u8; 4096]).unwrap();
+        // `already_gone` is recorded but never written — simulates a path
+        // some other process (or an earlier sweep) already removed.
+
+        let artifact = |path: &std::path::Path| OwnedArtifact {
+            path: path.to_path_buf(),
+            root: deps.clone(),
+            kind: ArtifactKind::OutDirEntry,
+            session_prefix: None,
+        };
+        let key = blake3::hash(b"already-gone").to_hex().to_string();
+        let mut state = FamilyState::new(&key, "foo");
+        state.orphans.push(Generation {
+            id: "old".into(),
+            created_unix_ms: now_ms(),
+            artifacts: vec![artifact(&real), artifact(&already_gone)],
+            orphaned_unix_ms: Some(0),
+        });
+        store.save_family(&state).unwrap();
+
+        let report = {
+            let _lock = store.lock_family(&key).unwrap();
+            sweep_locked(&store, &key, &policy(None, BudgetMode::OrphanOnly)).unwrap()
+        };
+
+        assert_eq!(report.deleted_artifacts, 1, "{report:?}");
+        assert_eq!(report.deleted_bytes, 4096, "the real reclaim, not diluted to zero");
+        assert_eq!(report.already_gone_artifacts, 1, "{report:?}");
+        assert!(!real.exists(), "the real artifact was actually removed");
+
+        // Shadow mode must draw the same distinction in its preview.
+        let store2 = store_in(&tmp.path().join("shadow"));
+        let mut state2 = FamilyState::new(&key, "foo");
+        fs::write(&real, vec![0u8; 4096]).unwrap();
+        state2.orphans.push(Generation {
+            id: "old".into(),
+            created_unix_ms: now_ms(),
+            artifacts: vec![artifact(&real), artifact(&already_gone)],
+            orphaned_unix_ms: Some(0),
+        });
+        store2.save_family(&state2).unwrap();
+        let shadow_report = {
+            let _lock = store2.lock_family(&key).unwrap();
+            sweep_locked(&store2, &key, &shadow_of(&policy(None, BudgetMode::OrphanOnly))).unwrap()
+        };
+        assert_eq!(shadow_report.deleted_bytes, 4096, "{shadow_report:?}");
+        assert_eq!(shadow_report.already_gone_artifacts, 1, "{shadow_report:?}");
+        assert!(real.exists(), "shadow mode must not delete anything");
+    }
+
+    /// R748-F6 — deletion path 1 of 3. A shadow sweep must report the figure a
+    /// real sweep would produce and leave the tree byte-identical, including
+    /// the bookkeeping: the operator has to be able to read the report, decide,
+    /// and then get exactly what was promised.
+    #[test]
+    fn a_shadow_sweep_reports_what_a_real_sweep_would_delete_and_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_in(tmp.path());
+        let deps = tmp.path().join("deps");
+        fs::create_dir_all(&deps).unwrap();
+        let doomed = deps.join("libfoo-abc.rlib");
+        let reused = deps.join("libfoo-abc.d");
+        fs::write(&doomed, vec![0u8; 4096]).unwrap();
+        fs::write(&reused, vec![0u8; 100]).unwrap();
+
+        let artifact = |path: &std::path::Path| OwnedArtifact {
+            path: path.to_path_buf(),
+            root: deps.clone(),
+            kind: ArtifactKind::OutDirEntry,
+            session_prefix: None,
+        };
+        let key = blake3::hash(b"shadow").to_hex().to_string();
+        let mut state = FamilyState::new(&key, "foo");
+        state.orphans.push(Generation {
+            id: "old".into(),
+            created_unix_ms: now_ms(),
+            artifacts: vec![artifact(&doomed), artifact(&reused)],
+            orphaned_unix_ms: Some(0),
+        });
+        state.current = Some(Generation {
+            id: "new".into(),
+            created_unix_ms: now_ms(),
+            artifacts: vec![artifact(&reused)],
+            orphaned_unix_ms: None,
+        });
+        store.save_family(&state).unwrap();
+        let real_policy = policy(None, BudgetMode::OrphanOnly);
+
+        let before = fs::read_dir(&deps).unwrap().count();
+        let shadow = sweep_locked(&store, &key, &shadow_of(&real_policy)).unwrap();
+
+        assert_eq!(shadow.deleted_artifacts, 1, "{shadow:?}");
+        assert_eq!(shadow.deleted_bytes, 4096, "the real byte figure, not an estimate");
+        assert_eq!(fs::read_dir(&deps).unwrap().count(), before, "no file left the tree");
+        assert!(doomed.exists());
+        // State must not advance either: a second shadow sweep has to report
+        // the same thing, and the queue must be intact when deletion is
+        // authorized later.
+        let after_state = store.load_family(&key).unwrap().unwrap();
+        assert_eq!(
+            after_state.orphans.iter().flat_map(|g| g.artifacts.iter()).count(),
+            2,
+            "shadow mode moves nothing in the orphan queue"
+        );
+        assert_eq!(
+            sweep_locked(&store, &key, &shadow_of(&real_policy)).unwrap().deleted_artifacts,
+            1,
+            "a shadow sweep is idempotent"
+        );
+
+        // The promise, kept: the same fixture swept for real.
+        let real = {
+            let _lock = store.lock_family(&key).unwrap();
+            sweep_locked(&store, &key, &real_policy).unwrap()
+        };
+        assert_eq!(real.deleted_artifacts, shadow.deleted_artifacts);
+        assert_eq!(real.deleted_bytes, shadow.deleted_bytes);
+        assert!(!doomed.exists());
+        assert!(reused.exists(), "a reused path is still never deleted");
+    }
+
+    /// R748-F6 — deletion path 3 of 3. Budget retirement is the only authority
+    /// that can take a generation nothing superseded, so shadow has to reach it
+    /// too: report which families the ceiling would cost, retire none of them,
+    /// and leave every current generation in place.
+    #[test]
+    fn a_shadow_budget_sweep_plans_retirements_without_taking_any() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_in(tmp.path());
+        let deps = tmp.path().join("deps");
+        family(&store, &deps, "hot", 1000, 1_000);
+        family(&store, &deps, "warm", 1000, 60_000);
+        family(&store, &deps, "cold", 1000, 900_000);
+        let real_policy = policy(Some(2400), BudgetMode::LruCurrentFamilies);
+
+        let plan = budget_sweep(&store, &shadow_of(&real_policy)).unwrap();
+
+        assert_eq!(plan.retired_families, 1, "{plan:?}");
+        assert!(plan.bytes_after <= 2400);
+        assert!(deps.join("libcold-abc123.rlib").exists(), "shadow retires nothing");
+        for name in ["hot", "warm", "cold"] {
+            let key = blake3::hash(name.as_bytes()).to_hex().to_string();
+            let state = store.load_family(&key).unwrap().unwrap();
+            assert!(state.current.is_some(), "{name} must still hold its generation");
+            assert!(state.orphans.is_empty(), "{name} must not be queued for deletion");
+        }
+
+        // And the plan is what the real run then executes.
+        let real = budget_sweep(&store, &real_policy).unwrap();
+        assert_eq!(real.retired_families, plan.retired_families);
+        assert!(!deps.join("libcold-abc123.rlib").exists());
     }
 
     /// Invariant F — unsafe path validation fails closed, per artifact kind:
@@ -618,6 +1089,7 @@ mod tests {
             id: "old".into(),
             created_unix_ms: now_ms(),
             artifacts: bad,
+            orphaned_unix_ms: Some(0),
         });
         store.save_family(&state).unwrap();
 
@@ -627,14 +1099,19 @@ mod tests {
         };
 
         assert_eq!(report.deleted_artifacts, 0, "{report:?}");
-        assert_eq!(report.deferred_artifacts, 3, "all three kinds stay queued");
+        // Only the two *deletable* kinds queue for retry. An incremental record
+        // is an anchor on a root shared by the whole workspace, never an owned
+        // object, so orphaning one is a no-op rather than a deferred deletion —
+        // queuing it would retry forever against something that can never
+        // become deletable.
+        assert_eq!(report.deferred_artifacts, 2, "both deletable kinds stay queued");
         assert!(deep.exists());
         assert!(stray_emit.exists());
-        assert!(incr.exists());
+        assert!(incr.exists(), "the shared incremental root must survive");
         let after = store.load_family(&key).unwrap().unwrap();
         assert_eq!(
             after.orphans.iter().flat_map(|g| g.artifacts.iter()).count(),
-            3,
+            2,
             "queued for retry, not forgotten"
         );
     }
@@ -665,6 +1142,64 @@ mod tests {
         assert!(
             deps.join("libcold-abc123.rlib").exists(),
             "an artifact under an active lease must survive"
+        );
+    }
+
+    /// Two families that both record the SAME incremental root with the SAME
+    /// session prefix measure the same bytes; the budget total must charge
+    /// those bytes once.
+    ///
+    /// This is the shape hash-sensitive family identity produces constantly —
+    /// a crate forks a family on every unit-hash change while its
+    /// `session_prefix` stays the crate name. Measured on the dogfooding camp
+    /// 2026-08-14: 66 families for `yah` alone, 3356 incremental-dir records
+    /// collapsing to 380 distinct (path, prefix) pairs, and a naive total of
+    /// 1978 GB against a real 81 GB. Undeduped, `max-bytes` reads as breached
+    /// on a tree nowhere near the ceiling and retires cold families for
+    /// nothing.
+    #[test]
+    fn budget_total_charges_a_shared_incremental_root_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_in(tmp.path());
+
+        // One incremental root with a single `demo-*` key dir of known size,
+        // recorded by two separate families exactly as the wrapper does.
+        let incremental = tmp.path().join("incremental");
+        let key_dir = incremental.join("demo-abc123");
+        fs::create_dir_all(&key_dir).unwrap();
+        fs::write(key_dir.join("dep-graph.bin"), vec![0u8; 8192]).unwrap();
+
+        for (n, name) in ["one", "two"].iter().enumerate() {
+            let artifacts = vec![OwnedArtifact {
+                path: incremental.clone(),
+                root: incremental.clone(),
+                kind: ArtifactKind::IncrementalDir,
+                session_prefix: Some("demo".to_string()),
+            }];
+            let key = blake3::hash(name.as_bytes()).to_hex().to_string();
+            let mut state = FamilyState::new(&key, name);
+            state.last_used_unix_ms = now_ms() - (n as u128 + 1) * 1000;
+            state.current = Some(Generation {
+                id: crate::state::generation_id(&artifacts),
+                created_unix_ms: now_ms(),
+                artifacts,
+                orphaned_unix_ms: None,
+            });
+            store.save_family(&state).unwrap();
+        }
+
+        // A ceiling far above the real 8 KiB, but below what a double count
+        // would report. Deduped this is inert; undeduped it retires a family.
+        let report =
+            budget_sweep(&store, &policy(Some(12_288), BudgetMode::LruCurrentFamilies)).unwrap();
+
+        assert_eq!(
+            report.bytes_before, 8192,
+            "the shared key dir must be charged once, not once per family"
+        );
+        assert_eq!(
+            report.retired_families, 0,
+            "a tree under the ceiling must retire nothing"
         );
     }
 }

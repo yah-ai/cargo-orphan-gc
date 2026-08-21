@@ -24,7 +24,10 @@ it watched being replaced:
   builds — on real shared trees the leftovers run 0–41% of the incremental
   tree, and deleting them costs zero rebuild time);
 - never delete an artifact another cooperating rustc is currently reading;
-- if ownership is ambiguous, **leak instead of delete**.
+- if ownership is ambiguous, **leak instead of delete**;
+- and on a fresh install it deletes **nothing at all** — `dry-run` defaults to
+  true, so the tool learns and reports first, and you authorize deletion after
+  reading what it would take.
 
 It composes with sccache by design: the tool owns Cargo's outer
 `rustc-wrapper` slot and invokes the cache itself (`inner-wrapper`), so the
@@ -61,6 +64,7 @@ That makes two small, reviewable changes. The policy, in your root
 ```toml
 [workspace.metadata.orphan-gc]
 enabled = true
+dry-run = true              # shadow mode: learn and report, delete nothing
 pending-sweeps-per-compile = 4
 ```
 
@@ -107,10 +111,36 @@ cargo → cargo-orphan-gc [inner-wrapper] <real-rustc> <args…>
 Registry and git dependencies pass straight through to the inner wrapper with
 no bookkeeping. If rustc fails, nothing is retired.
 
-### 4. Inspect and sweep
+### 4. Read the report, then authorize deletion
+
+**A fresh install deletes nothing.** `dry-run = true` is the default: the
+wrapper learns what each build owns, records generations, queues superseded
+ones — and reports what a sweep *would* reclaim.
 
 ```bash
-cargo orphan-gc status   # families, live/orphan bytes, watermark or ceiling
+cargo orphan-gc status        # includes "would reclaim now: ..."
+cargo orphan-gc sweep --dry-run
+cargo orphan-gc log           # what the wrapper did, per invocation
+```
+
+Those numbers come from the real sweep's own decision path — the same
+deletability gate, the same active-build leases, the same surplus-session
+rule — so what it promises is what it takes. When they look right:
+
+```toml
+[workspace.metadata.orphan-gc]
+dry-run = false               # now it deletes
+```
+
+Shadow is the default because a compiler wrapper that deletes files is not
+something to enable on evidence gathered from someone else's tree, and
+especially not on a shared one: a family-identity bug in an early version
+deleted a live `.rmeta` mid-build and broke every concurrent build in a
+ten-agent workspace. Shadow mode shows that class of problem for free.
+
+### 5. Sweep
+
+```bash
 cargo orphan-gc sweep    # retry deferred deletions; enforce budget mode
 ```
 
@@ -118,17 +148,32 @@ Sweeping also happens automatically after successful compiles
 (`pending-sweeps-per-compile` families per compile), so the manual command is
 for diagnostics, timers, and budget enforcement — not normal operation.
 
+### Where the log goes
+
+The wrapper never writes to the compiler's stderr. Cargo captures each unit's
+compiler stderr into `target/<profile>/.fingerprint/` and replays it on later
+builds, so a line printed there would keep reappearing long after the run it
+described — reporting deletions that already happened, in builds that deleted
+nothing. The log is a bounded file under the state dir instead
+(`cargo orphan-gc log`), timestamped and pid-stamped, echoed to stderr only
+when stderr is a terminal.
+
 ## Configuration
 
 ```toml
 [workspace.metadata.orphan-gc]
 enabled = true                      # false = wrapper is transparent (cache still runs)
-verbose = false                     # print per-compile GC summaries to stderr
+dry-run = true                      # DEFAULT. true = learn and report, delete nothing
+verbose = false                     # log a per-compile GC summary (see `orphan-gc log`)
+full-scan-every = 16                # walk the out-dir every Nth compile (0 = always)
 pending-sweeps-per-compile = 4
 inner-wrapper = "sccache"           # optional chained compiler cache
 # max-bytes = 214748364800
 # budget-mode = "lru-current-families"
 ```
+
+`dry-run` defaults to **true**, including for a manifest that says only
+`enabled = true`. Deletion is never something you get by accident.
 
 ### `max-bytes` is honest about what it can promise
 
@@ -174,7 +219,16 @@ never-rebuilt families leak until a `cargo clean`
 cargo test                      # invariants A–G + an end-to-end through real cargo
 ./scripts/wrapper-chain-ab.sh   # the sccache composition A/B/C, against a
                                 # private sccache server
+./scripts/adoption-demo.sh <workspace-dir>
+                                # copies a real workspace, bootstraps into it
+                                # as a new user would, manufactures the
+                                # shared-tree session surplus, and reclaims it
 ```
+
+`adoption-demo.sh` is the reproduction behind the reclamation claim above: on
+a copied ~180 MB workspace it collected three surplus sessions (182 → 138 MB
+on disk, 24% of the incremental tree) in one sweep at zero rebuild cost, with
+the wrapped edit-recheck loop still at 0.95 s afterwards.
 
 ## Uninstall
 
@@ -189,6 +243,17 @@ any time.
   conventions; an upstream Cargo implementation would have direct artifact
   identity instead of inferring it (see `ARCHITECTURE.md` §15).
 - Only artifacts observed after installation are governed.
+- Per-compile overhead is dominated by walking the out-dir, which is shared by
+  the whole workspace: measured 145 ms per rustc invocation at 210k entries in
+  `target/debug/deps` before this was addressed, and that walk is already at the
+  filesystem's floor. `full-scan-every` (default 16) skips it while every
+  recorded artifact is still present, bringing it to ~6 ms (14 ms amortized),
+  at the cost of learning a newly-emitted artifact up to that many compiles
+  late. Set `full-scan-every = 0` to always walk.
+- Shadow mode's budget-retirement figure is an optimistic bound: it names
+  exactly which families a ceiling would retire, but assumes their bytes are
+  then fully reclaimable, where a real run may defer some behind an active
+  lease. The orphan and surplus-session figures are exact.
 - Windows is untested (advisory `fs2` locking; no CI matrix yet).
 - Cargo's experimental `-Zfine-grain-locking` changes the locking model this
   tool's correctness argument leans on; not yet supported.

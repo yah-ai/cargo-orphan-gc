@@ -4,8 +4,18 @@ resolver = "2"
 
 [workspace.metadata.orphan-gc]
 enabled = true
-# Print each successful GC action.
+# Shadow mode, and the default `bootstrap` writes: learn ownership, record
+# generations, report what a sweep WOULD reclaim — delete nothing. Read
+# `cargo orphan-gc status`, then set this to false to authorize deletion.
+dry-run = true
+# Log each successful GC action (to <state-dir>/log; `cargo orphan-gc log`).
 verbose = false
+# Walk the shared out-dir every Nth compile; in between, reuse the previous
+# generation's artifact list when every one of its files is still there. The
+# walk is linear in the size of a directory the whole workspace shares (145 ms
+# at 210k entries, measured), and reuse can only under-record ownership, which
+# leaks rather than over-deletes. 0 = walk every time.
+full-scan-every = 16
 # Retry a small number of previously-blocked orphan families after every compile.
 pending-sweeps-per-compile = 4
 # Optional warning watermark. In orphan-only mode this does NOT authorize
